@@ -73,27 +73,53 @@ function parseCsvLine(line: string): string[] {
   return fields;
 }
 
-async function fetchSatcat(): Promise<Map<number, SatcatEntry>> {
-  const res = await fetch(CELESTRAK_SATCAT_URL, { headers: FETCH_HEADERS });
-  if (!res.ok) throw new Error(`SATCAT fetch failed: ${res.status}`);
-  const text = await res.text();
+function parseSatcatCsv(text: string): [number, SatcatEntry][] {
   const lines = text.split("\n").filter(Boolean);
   const header = parseCsvLine(lines[0]).map((h) => h.trim());
   const noradIdx = header.indexOf("NORAD_CAT_ID");
   const ownerIdx = header.indexOf("OWNER");
   const launchIdx = header.indexOf("LAUNCH_DATE");
 
-  const map = new Map<number, SatcatEntry>();
+  const entries: [number, SatcatEntry][] = [];
   for (let i = 1; i < lines.length; i++) {
     const cols = parseCsvLine(lines[i]);
     const noradId = Number(cols[noradIdx]);
     if (!Number.isFinite(noradId)) continue;
-    map.set(noradId, {
-      country: cols[ownerIdx]?.trim() || null,
-      launchDate: cols[launchIdx]?.trim() || null,
-    });
+    entries.push([
+      noradId,
+      { country: cols[ownerIdx]?.trim() || null, launchDate: cols[launchIdx]?.trim() || null },
+    ]);
   }
-  return map;
+  return entries;
+}
+
+/**
+ * Fetches SATCAT, falling back to the on-disk cache (then an empty map) if
+ * CelesTrak's IP-level throttle is active. Unlike the per-GROUP throttle,
+ * CelesTrak explicitly resets this one's 2-hour countdown on every repeated
+ * hit while it's blocked ("access will be restored once excessive downloads
+ * have ceased for 2 hours") — so on failure we must NOT retry, not even
+ * once, or we push the unblock time further out.
+ */
+async function fetchSatcat(): Promise<Map<number, SatcatEntry>> {
+  try {
+    const res = await fetch(CELESTRAK_SATCAT_URL, { headers: FETCH_HEADERS });
+    if (!res.ok) throw new Error(`SATCAT fetch failed: ${res.status}`);
+    const entries = parseSatcatCsv(await res.text());
+    await mkdir(CACHE_DIR, { recursive: true });
+    await writeFile(path.join(CACHE_DIR, "satcat.json"), JSON.stringify(entries));
+    return new Map(entries);
+  } catch (err) {
+    try {
+      const raw = await readFile(path.join(CACHE_DIR, "satcat.json"), "utf8");
+      const entries: [number, SatcatEntry][] = JSON.parse(raw);
+      console.log(`  live SATCAT fetch failed (${(err as Error).message}), using cached copy (${entries.length} entries)`);
+      return new Map(entries);
+    } catch {
+      console.warn(`  skipping SATCAT: ${(err as Error).message} (no cache available) — country/launch date won't be set for new satellites`);
+      return new Map();
+    }
+  }
 }
 
 const FETCH_HEADERS = {
@@ -154,8 +180,15 @@ async function fetchGroup(group: string): Promise<CelestrakGpEntry[]> {
 }
 
 async function main() {
-  console.log("Fetching SATCAT (country / launch date)...");
-  const satcat = await fetchSatcat();
+  const skipSatcat = process.argv.includes("--skip-satcat");
+  let satcat: Map<number, SatcatEntry>;
+  if (skipSatcat) {
+    console.log("Skipping SATCAT (--skip-satcat): reusing whatever country/launch_date is already in the DB.");
+    satcat = new Map();
+  } else {
+    console.log("Fetching SATCAT (country / launch date)...");
+    satcat = await fetchSatcat();
+  }
   console.log(`SATCAT: ${satcat.size} entries`);
 
   const byNoradId = new Map<number, SatelliteRow>();
@@ -196,8 +229,8 @@ async function main() {
          VALUES ($1, $2, $3, $4, $5, $6, $7, now())
          ON CONFLICT (norad_id) DO UPDATE SET
            object_name = EXCLUDED.object_name,
-           country = EXCLUDED.country,
-           launch_date = EXCLUDED.launch_date,
+           country = COALESCE(EXCLUDED.country, satellites.country),
+           launch_date = COALESCE(EXCLUDED.launch_date, satellites.launch_date),
            constellation = EXCLUDED.constellation,
            tle_line1 = EXCLUDED.tle_line1,
            tle_line2 = EXCLUDED.tle_line2,
