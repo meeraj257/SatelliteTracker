@@ -39,3 +39,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local cache of CelesTrak responses (see scripts/fetch-tle.ts)
+/.cache/
