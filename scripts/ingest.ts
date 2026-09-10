@@ -1,16 +1,23 @@
 /**
- * Long-running worker: every 5 minutes, propagates every tracked satellite's
- * TLE to the current instant and writes a snapshot row into the
- * `satellite_positions` hypertable.
+ * Long-running worker with two independent cron jobs:
+ *  - every 5 minutes: propagates every tracked satellite's TLE to the
+ *    current instant and writes a snapshot row into the
+ *    `satellite_positions` hypertable.
+ *  - once a day: refreshes the `satellites` catalog from CelesTrak (new
+ *    launches, updated TLEs) via fetch-tle.ts's fetchAndUpsertSatellites.
+ *    Only runs on the daily cron tick, not at worker startup — CelesTrak
+ *    rate-limits repeated catalog fetches, so a worker that gets restarted
+ *    often (e.g. during development) shouldn't hit it every time it boots.
  *
- * Usage: npx tsx scripts/ingest.ts        (runs forever, snapshotting on a cron)
- *        npx tsx scripts/ingest.ts --once (single snapshot, useful for testing)
+ * Usage: npx tsx scripts/ingest.ts        (runs forever, both jobs on cron)
+ *        npx tsx scripts/ingest.ts --once (single position snapshot only, useful for testing)
  */
 import { config } from "dotenv";
 config({ path: ".env.local" });
 import cron from "node-cron";
 import { getPool } from "../lib/db";
 import { propagateTle } from "../lib/orbital";
+import { fetchAndUpsertSatellites } from "./fetch-tle";
 
 const BATCH_SIZE = 500;
 
@@ -91,10 +98,16 @@ async function main() {
     return;
   }
 
-  console.log("Starting satellite snapshot worker (every 5 minutes)...");
+  console.log("Starting satellite snapshot worker (every 5 minutes) + daily CelesTrak catalog refresh (03:00 UTC)...");
   await runSnapshot().catch((err) => console.error("Initial snapshot failed:", err));
   cron.schedule("*/5 * * * *", () => {
     runSnapshot().catch((err) => console.error("Snapshot failed:", err));
+  });
+  cron.schedule("0 3 * * *", () => {
+    console.log(`[${new Date().toISOString()}] Running daily CelesTrak catalog refresh...`);
+    fetchAndUpsertSatellites({ closePool: false }).catch((err) =>
+      console.error("Daily catalog refresh failed:", err)
+    );
   });
 }
 

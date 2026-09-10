@@ -2,9 +2,13 @@
  * Pulls current TLEs from CelesTrak for the tracked groups plus the SATCAT
  * catalog (for country + launch date), and upserts everything into the
  * `satellites` reference table. Run this periodically (e.g. daily) to keep
- * TLEs fresh — orbital elements decay in accuracy after a few days.
+ * TLEs fresh and pick up newly launched satellites — orbital elements decay
+ * in accuracy after a few days.
  *
- * Usage: npx tsx scripts/fetch-tle.ts
+ * Usage as a CLI: npx tsx scripts/fetch-tle.ts [--skip-satcat]
+ * Usage as a library: import { fetchAndUpsertSatellites } from "./fetch-tle"
+ * (scripts/ingest.ts does this to run it on a daily cron alongside the
+ * 5-minute position snapshots).
  */
 import { config } from "dotenv";
 config({ path: ".env.local" });
@@ -179,8 +183,22 @@ async function fetchGroup(group: string): Promise<CelestrakGpEntry[]> {
   }
 }
 
-async function main() {
-  const skipSatcat = process.argv.includes("--skip-satcat");
+export interface FetchTleOptions {
+  /** Skip the SATCAT (country/launch_date) request entirely — use when it's
+   * known to be under CelesTrak's IP-level throttle, since even a failed
+   * live attempt resets that throttle's countdown. */
+  skipSatcat?: boolean;
+  /** Close the shared pg pool when done. The standalone CLI wants this;
+   * a long-running caller (e.g. the ingest worker) shares the pool with
+   * other queries and must keep it open. */
+  closePool?: boolean;
+}
+
+/** Pulls TLEs + SATCAT from CelesTrak for all tracked groups and upserts
+ * them into the `satellites` table. See scripts/fetch-tle.ts module docs
+ * for the CelesTrak rate-limit handling this relies on. */
+export async function fetchAndUpsertSatellites(options: FetchTleOptions = {}): Promise<void> {
+  const { skipSatcat = false, closePool = false } = options;
   let satcat: Map<number, SatcatEntry>;
   if (skipSatcat) {
     console.log("Skipping SATCAT (--skip-satcat): reusing whatever country/launch_date is already in the DB.");
@@ -255,11 +273,14 @@ async function main() {
     throw err;
   } finally {
     client.release();
-    await pool.end();
+    if (closePool) await pool.end();
   }
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+const isMainModule = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
+if (isMainModule) {
+  fetchAndUpsertSatellites({ skipSatcat: process.argv.includes("--skip-satcat"), closePool: true }).catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
